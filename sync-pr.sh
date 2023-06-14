@@ -201,6 +201,7 @@ applyNixfmt() {
   step "Running nixfmt on nixpkgs"
   if ! xargs -r -0 -P"$(nproc)" -n1 -a <(find nixpkgs -type f -name '*.nix' -print0) result/bin/nixfmt; then
     echo -e "\e[31mFailed to run nixfmt on some files\e[0m"
+    exit 1
   fi
 }
 
