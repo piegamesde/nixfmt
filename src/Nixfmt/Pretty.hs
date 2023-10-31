@@ -4,7 +4,7 @@
  - SPDX-License-Identifier: MPL-2.0
  -}
 
-{-# LANGUAGE FlexibleInstances, OverloadedStrings #-}
+{-# LANGUAGE FlexibleInstances, OverloadedStrings, RankNTypes, TupleSections #-}
 
 module Nixfmt.Pretty where
 
@@ -16,148 +16,364 @@ import Data.Text (Text, isPrefixOf, isSuffixOf, stripPrefix)
 import qualified Data.Text as Text
   (dropEnd, empty, init, isInfixOf, last, null, strip, takeWhile)
 
+-- import Debug.Trace (traceShowId)
 import Nixfmt.Predoc
-  (Doc, Pretty, base, emptyline, group, hardline, hardspace, hcat, line, line',
-  nest, newline, pretty, sepBy, softline, softline', text, textWidth)
+  (Doc, Pretty, base, emptyline, group, group', hardline, hardspace, hcat, line, line',
+  nest, newline, pretty, sepBy, surroundWith, softline, softline', text, comment, trailing, textWidth)
 import Nixfmt.Types
-  (Ann(..), Binder(..), Expression(..), File(..), Leaf, ParamAttr(..),
-  Parameter(..), Selector(..), SimpleSelector(..), StringPart(..), Term(..),
-  Token(..), TrailingComment(..), Trivia, Trivium(..), tokenText)
+  (Ann(..), Binder(..), Expression(..), Item(..), Items(..), Leaf,
+  ParamAttr(..), Parameter(..), Selector(..), SimpleSelector(..),
+  StringPart(..), Term(..), Token(..), TrailingComment(..), Trivium(..),
+  Whole(..), tokenText, mapFirstToken')
 import Nixfmt.Util (commonIndentation, isSpaces, replaceMultiple)
 
 prettyCommentLine :: Text -> Doc
 prettyCommentLine l
     | Text.null l = emptyline
-    | otherwise   = text l <> hardline
+    | otherwise   = comment l <> hardline
 
-toLineComment :: Text -> Trivium
-toLineComment c = LineComment $ fromMaybe (" " <> c) $ stripPrefix "*" c
+toLineComment :: TrailingComment -> Trivium
+toLineComment (TrailingComment c) = LineComment $ " " <> c
+
+-- The prime variant also strips leading * prefix
+toLineComment' :: Text -> Trivium
+toLineComment' c = LineComment $ fromMaybe (" " <> c) $ stripPrefix "*" c
+
+-- If the token has some trailing comment after it, move that in front of the token
+moveTrailingCommentUp :: Ann a -> Ann a
+moveTrailingCommentUp (Ann pre a (Just post)) = Ann (pre ++ [toLineComment post]) a Nothing
+moveTrailingCommentUp a = a
 
 instance Pretty TrailingComment where
     pretty (TrailingComment c)
-        = hardspace <> text "#" <> hardspace <> text c <> hardline
+        = hardspace <> comment ("# " <> c) <> hardline
 
 instance Pretty Trivium where
     pretty EmptyLine        = emptyline
-    pretty (LineComment c)  = text "#" <> pretty c <> hardline
+    pretty (LineComment c)  = comment ("#" <> c) <> hardline
     pretty (BlockComment c)
-        | all ("*" `isPrefixOf`) (tail c) = hcat (map toLineComment c)
+        | all ("*" `isPrefixOf`) (tail c) = hcat (map toLineComment' c)
         | otherwise
-            = base $ text "/*" <> hardspace
+            = base $ comment "/*" <> hardspace
               <> nest 3 (hcat (map prettyCommentLine c))
-              <> text "*/" <> hardline
+              <> comment "*/" <> hardline
+
+instance Pretty a => Pretty (Item a) where
+    pretty (DetachedComments trivia) = pretty trivia
+    pretty (CommentedItem trivia x) = pretty trivia <> group x
+
+-- For lists, attribute sets and let bindings
+prettyItems :: Pretty a => Doc -> Items a -> Doc
+prettyItems sep = prettyItems' . unItems
+  where
+    prettyItems' :: Pretty a => [Item a] -> Doc
+    prettyItems' [] = mempty
+    prettyItems' [item] = pretty item
+    prettyItems' (item : xs)
+        = pretty item
+        <> case item of { CommentedItem _ _ -> sep; DetachedComments _ -> emptyline }
+        <> prettyItems' xs
 
 instance Pretty [Trivium] where
     pretty []     = mempty
     pretty trivia = hardline <> hcat trivia
 
 instance Pretty a => Pretty (Ann a) where
-    pretty (Ann x trailing leading)
-        = pretty x <> pretty trailing <> pretty leading
+    pretty (Ann leading x trailing')
+        = pretty leading <> pretty x <> pretty trailing'
 
 instance Pretty SimpleSelector where
     pretty (IDSelector i)              = pretty i
     pretty (InterpolSelector interpol) = pretty interpol
-    pretty (StringSelector (Ann s trailing leading))
-        = prettySimpleString s <> pretty trailing <> pretty leading
+    pretty (StringSelector (Ann leading s trailing'))
+        = pretty leading <> prettySimpleString s <> pretty trailing'
 
 instance Pretty Selector where
     pretty (Selector dot sel Nothing)
         = pretty dot <> pretty sel
 
     pretty (Selector dot sel (Just (kw, def)))
-        = pretty dot <> pretty sel
-          <> hardspace <> pretty kw <> hardspace <> pretty def
+        = base $ pretty dot <> pretty sel
+          <> softline <> nest 2 (pretty kw <> hardspace <> pretty def)
 
+-- in attrsets and let bindings
 instance Pretty Binder where
+    -- `inherit bar` statement
     pretty (Inherit inherit Nothing ids semicolon)
-        = base $ group (pretty inherit <> softline
-                 <> nest 2 (sepBy softline ids)) <> pretty semicolon
+        = base $ group (pretty inherit
+            <> (if null ids then mempty else line <> nest 2 (sepBy (if length ids < 4 then line else hardline) ids) <> line')
+            <> pretty semicolon)
 
-    pretty (Inherit inherit source ids semicolon)
-        = base $ group (pretty inherit <> hardspace
-                 <> pretty source <> line
-                 <> nest 2 (sepBy softline ids)) <> pretty semicolon
+    -- `inherit (foo) bar` statement
+    pretty (Inherit inherit (Just source) ids semicolon)
+        = base $ group (pretty inherit <> nest 2 (
+            (group' False (line <> pretty source))
+                <> if null ids then mempty else line
+                <> sepBy (if length ids < 4 then line else hardline) ids
+        ) <> line' <> pretty semicolon)
 
+    -- `foo = bar`
     pretty (Assignment selectors assign expr semicolon)
-        = base $ group (hcat selectors <> hardspace
-                 <> nest 2 (pretty assign <> softline <> pretty expr))
-          <> pretty semicolon
+        = base $ group $ hcat selectors
+                 <> nest 2 (hardspace <> pretty assign <> inner) <> pretty semicolon
+        where
+        inner =
+            case expr of
+              -- Absorbable term. Always start on the same line, keep semicolon attatched
+              (Term t) | isAbsorbable t -> hardspace <> prettyTermWide t
+              -- Not all strings are absorbably, but in this case we always want to keep them attached.
+              -- Because there's nothing to gain from having them start on a new line.
+              (Term (String _)) -> hardspace <> group expr
+              -- Same for path
+              (Term (Path _)) -> hardspace <> group expr
+              -- Non-absorbable term
+              -- If it is multi-line, force it to start on a new line with indentation
+              (Term _) -> group' False (line <> pretty expr)
+              -- Function call
+              -- Absorb if all arguments except the last fit into the line, start on new line otherwise
+              (Application f a) -> prettyApp hardline line mempty mempty f a
+              -- Absorb function declarations but only those with simple parameter(s)
+              (Abstraction _ _ _) | isAbstractionWithAbsorbableTerm expr -> hardspace <> group expr
+              -- With expression with absorbable body: Try to absorb and keep the semicolon attached, spread otherwise
+              (With _ _ _ (Term t)) | isAbsorbable t -> softline <> group expr
+              -- Special case `//` operations to be more compact in some cases
+              -- Case 1: two arguments, LHS is absorbable term, RHS fits onto the last line
+              (Operation (Term t) (Ann [] TUpdate Nothing) b) | isAbsorbable t ->
+                group' False $ line <> group' True (prettyTermWide t) <> line <> pretty TUpdate <> hardspace <> pretty b
+              -- Case 2a: LHS fits onto first line, RHS is an absorbable term
+              (Operation l (Ann [] TUpdate Nothing) (Term t)) | isAbsorbable t ->
+                group' False $ line <> pretty l <> line <> group' True (pretty TUpdate <> hardspace <> prettyTermWide t)
+              -- Case 2b: LHS fits onto first line, RHS is a function application
+              (Operation l (Ann [] TUpdate Nothing) (Application f a)) ->
+                line <> (group l) <> line <> prettyApp hardline (pretty TUpdate <> hardspace) mempty mempty f a
+              -- Special case `++` operations to be more compact in some cases
+              -- Case 1: two arguments, LHS is absorbable term, RHS fits onto the last line
+              (Operation (Term t) (Ann [] TConcat Nothing) b) | isAbsorbable t ->
+                group' False $ line <> group' True (prettyTermWide t) <> line <> pretty TConcat <> hardspace <> pretty b
+              -- Case 2a: LHS fits onto first line, RHS is an absorbable term
+              (Operation l (Ann [] TConcat Nothing) (Term t)) | isAbsorbable t ->
+                group' False $ line <> pretty l <> line <> group' True (pretty TConcat <> hardspace <> prettyTermWide t)
+              -- Case 2b: LHS fits onto first line, RHS is a function application
+              (Operation l (Ann [] TConcat Nothing) (Application f a)) ->
+                line <> (group l) <> line <> prettyApp hardline (pretty TConcat <> hardspace) mempty mempty f a
+              -- Everything else:
+              -- If it fits on one line, it fits
+              -- If it fits on one line but with a newline after the `=`, it fits (including semicolon)
+              -- Otherwise, start on new line, expand fully (including the semicolon)
+              _ -> line <> group expr
+
+-- Pretty a set
+-- while we already pretty eagerly expand sets with more than one element,
+-- in some situations even that is not sufficient. The wide parameter will
+-- be even more eager at expanding, except for empty sets and inherit statements.
+prettySet :: Bool -> (Maybe Leaf, Leaf, Items Binder, Leaf) -> Doc
+-- Empty, non-recursive attribute set
+prettySet _ (Nothing, Ann [] paropen Nothing, Items [], parclose@(Ann [] _ _))
+    = pretty paropen <> hardspace <> pretty parclose
+-- Singleton sets are allowed to fit onto one line,
+-- but apart from that always expand.
+prettySet wide (krec, Ann pre paropen post, binders, parclose)
+    = base $ pretty (fmap (, hardspace) krec) <>
+        pretty (Ann pre paropen Nothing)
+        <> (surroundWith sep $ nest 2 $ pretty post <> prettyItems hardline binders)
+        <> pretty parclose
+    where
+        sep = if wide && not (null (unItems binders)) then hardline else line
+
+prettyTermWide :: Term -> Doc
+prettyTermWide (Set krec paropen items parclose) = prettySet True (krec, paropen, items, parclose)
+prettyTermWide t = prettyTerm t
 
 -- | Pretty print a term without wrapping it in a group.
 prettyTerm :: Term -> Doc
 prettyTerm (Token t) = pretty t
 prettyTerm (String s) = pretty s
 prettyTerm (Path p) = pretty p
-prettyTerm (Selection term selectors) = pretty term <> hcat selectors
+-- Selection (`foo.bar.baz`) case distinction on the first element (`foo`):
+-- If it is an ident, keep it all together
+prettyTerm (Selection term@(Token _) selectors) = pretty term <> hcat selectors
+-- If it is a parenthesized expression, maybe add a line break
+prettyTerm (Selection term@(Parenthesized _ _ _) selectors) = pretty term <> softline' <> hcat selectors
+-- Otherwise, very likely add a line break
+prettyTerm (Selection term selectors) = pretty term <> line' <> hcat selectors
 
-prettyTerm (List (Ann paropen Nothing []) [] parclose)
-    = pretty paropen <> hardspace <> pretty parclose
+-- Empty list
+prettyTerm (List (Ann leading paropen Nothing) (Items []) (Ann [] parclose trailing'))
+    = pretty leading <> pretty paropen <> hardspace <> pretty parclose <> pretty trailing'
 
-prettyTerm (List (Ann paropen Nothing []) [item] parclose)
-    | isAbsorbable item
-        = pretty paropen <> pretty item <> pretty parclose
+-- General list
+-- Always expand if len > 1
+prettyTerm (List (Ann pre paropen post) items parclose) =
+    base $ pretty (Ann pre paropen Nothing)
+    <> (surroundWith line $ nest 2 $ pretty post <> prettyItems hardline items)
+    <> pretty parclose
 
-prettyTerm (List (Ann paropen trailing leading) items parclose)
-    = base $ pretty paropen <> pretty trailing <> line
-        <> nest 2 (pretty leading <> sepBy line (map group items)) <> line
-        <> pretty parclose
+prettyTerm (Set krec paropen items parclose) = prettySet False (krec, paropen, items, parclose)
 
-prettyTerm (Set Nothing (Ann paropen Nothing []) [] parclose)
-    = pretty paropen <> hardspace <> pretty parclose
+-- Parenthesized application
+prettyTerm (Parenthesized (Ann pre paropen post) (Application f a) parclose)
+    = base $ group $ pretty (Ann pre paropen Nothing) <> nest 2 (
+            -- Move comment trailing on '(' to next line, combine with comment from application
+            case pretty post of { [] -> []; c -> hardline <> c }
+            <> base (prettyApp hardline mempty line' hardline f a)
+            <> case pretty post of  { [] -> mempty; _ -> hardline }
+        ) <> pretty parclose
 
-prettyTerm (Set krec (Ann paropen trailing leading) binders parclose)
-    = base $ pretty (fmap ((<>hardspace) . pretty) krec)
-        <> pretty paropen <> pretty trailing <> line
-        <> nest 2 (pretty leading <> sepBy hardline binders) <> line
-        <> pretty parclose
-
-prettyTerm (Parenthesized (Ann paropen trailing leading) expr parclose)
-    = base $ pretty paropen <> pretty trailing
-        <> nest 2 (pretty leading <> group expr) <> pretty parclose
+-- Parentheses
+prettyTerm (Parenthesized paropen expr parclose)
+    = base $ group $ pretty paropen <> lineL <> nest 2 (group expr) <> lineR <> pretty parclose
+  where
+    (lineL, lineR) =
+      case expr of
+        -- Start on the same line for these
+        (Term t) | isAbsorbable t -> (mempty, mempty)
+        -- unreachable
+        (Application _ _) -> (mempty, mempty)
+        -- Absorb function declarations but only those with simple parameter(s)
+        (Abstraction _ _ _) | isAbstractionWithAbsorbableTerm expr -> (mempty, mempty)
+        (Operation _ _ _) -> (line', line')
+        -- Same thing for selections
+        (Term (Selection t _)) | isAbsorbable t -> (line', line')
+        (Term (Selection _ _)) -> (mempty, line')
+        -- Start on a new line for the others
+        _ -> (line', line')
 
 instance Pretty Term where
-    pretty l@(List _ _ _) = group $ prettyTerm l
-    pretty x              = prettyTerm x
+    pretty l@List{} = group $ prettyTerm l
+    pretty x        = prettyTerm x
 
-toLeading :: Maybe TrailingComment -> Trivia
-toLeading Nothing = []
-toLeading (Just (TrailingComment c)) = [LineComment (" " <> c)]
-
-prettyComma :: Maybe Leaf -> Doc
-prettyComma Nothing = mempty
-prettyComma (Just comma) = softline' <> pretty comma <> hardspace
-
+-- Does not move around comments, nor does it inject a trailing comma
 instance Pretty ParamAttr where
-    pretty (ParamAttr name Nothing comma)
-        = pretty name <> prettyComma comma
+    -- Simple parameter (no default)
+    pretty (ParamAttr name Nothing maybeComma)
+        = pretty name <> pretty maybeComma
 
-    pretty (ParamAttr name (Just (qmark, def)) comma)
+    -- With ? default
+    pretty (ParamAttr name (Just (qmark, def)) maybeComma)
         = group (pretty name <> hardspace <> pretty qmark
             <> absorb softline mempty (Just 2) def)
-            <> prettyComma comma
+            <> pretty maybeComma
 
+    -- `...`
     pretty (ParamEllipsis ellipsis)
         = pretty ellipsis
 
+-- Move comments around and inject trailing commas everywhere
+moveParamAttrComment :: ParamAttr -> ParamAttr
+-- Simple parameter, move comment around
+-- Move comments around when switching from leading comma to trailing comma style:
+-- `, name # foo` → `name, #foo`
+moveParamAttrComment (ParamAttr (Ann trivia name (Just comment')) Nothing (Just (Ann trivia' comma Nothing)))
+    = ParamAttr (Ann trivia name Nothing) Nothing (Just (Ann trivia' comma (Just comment')))
+-- Simple parameter, move comment around and add trailing comma
+-- Same as above, but also add trailing comma
+moveParamAttrComment (ParamAttr (Ann trivia name (Just comment')) Nothing Nothing)
+    = ParamAttr (Ann trivia name Nothing) Nothing (Just (Ann [] TComma (Just comment')))
+-- Other cases, just inject a trailing comma
+moveParamAttrComment (ParamAttr name def Nothing)
+    = ParamAttr name def (Just (Ann [] TComma Nothing))
+moveParamAttrComment x = x
+
+-- When a `, name` entry has some line comments before it, they are actually attached to the comment
+-- of the preceding item. Move them to the next one
+moveParamsComments :: [ParamAttr] -> [ParamAttr]
+moveParamsComments
+    ((ParamAttr name maybeDefault (Just (Ann trivia comma Nothing))) : (ParamAttr (Ann [] name' Nothing) maybeDefault' maybeComma') : xs)
+    = (ParamAttr name maybeDefault (Just (Ann [] comma Nothing))) : moveParamsComments ((ParamAttr (Ann trivia name' Nothing) maybeDefault' maybeComma') : xs)
+moveParamsComments (x : xs) = x : moveParamsComments xs
+moveParamsComments [] = []
+
 instance Pretty Parameter where
+    -- param:
     pretty (IDParameter i) = pretty i
-    pretty (SetParameter bopen attrs bclose)
-        = group $ pretty bopen <> hardspace
-                  <> hcat attrs <> softline
-                  <> pretty bclose
+
+    -- {}:
+    pretty (SetParameter bopen [] bclose)
+        = group $ pretty bopen <> hardspace <> pretty bclose
+
+    -- { stuff }:
+    pretty (SetParameter bopen attrs bclose) =
+        group $
+            pretty bopen
+            <> (surroundWith sep $ nest 2 (sepBy sep $ handleTrailingComma $ map moveParamAttrComment $ moveParamsComments $ attrs))
+            <> pretty bclose
+        where
+        -- pretty all ParamAttrs, but make the trailing comma of the last element specially
+        handleTrailingComma :: [ParamAttr] -> [Doc]
+        handleTrailingComma [] = []
+        -- That's the case we're interested in
+        handleTrailingComma [(ParamAttr name maybeDefault (Just (Ann [] TComma Nothing)))]
+            = [pretty (ParamAttr name maybeDefault Nothing) <> trailing ","]
+        handleTrailingComma (x:xs) = pretty x : handleTrailingComma xs
+
+        sep = case attrs of
+            [] -> line
+            [ParamEllipsis _] -> line
+            -- Attributes must be without default
+            [ParamAttr _ Nothing _] -> line
+            [ParamAttr _ Nothing _, ParamEllipsis _] -> line
+            [ParamAttr _ Nothing _, ParamAttr _ Nothing _] -> line
+            [ParamAttr _ Nothing _, ParamAttr _ Nothing _, ParamEllipsis _] -> line
+            _ -> hardline
 
     pretty (ContextParameter param1 at param2)
         = pretty param1 <> pretty at <> pretty param2
 
+
+-- Function application
+-- Some example mapping of Nix code to Doc (using brackets as groups, but omitting the outermost group
+-- and groups around the expressions for conciseness):
+-- `f a` -> pre f line a post
+-- `f g a` -> pre [f line g] line a post
+-- `f g h a` -> pre [[f line g] line h] line a post
+-- `f g h i a` -> pre [[[f line g] line h] line i] line a post
+-- As you can see, it separates the elements by `line` whitespace. However, there are three tricks to make it look good:
+-- First, for each function call (imagine the fully parenthesised Nix code), we group it. Due to the greedy expansion
+-- of groups this means that it will place as many function calls on the first line as possible, but then all the remaining
+-- ones on a separate line each.
+-- Second, the last argument is declared as "priority" group, meaning that the layouting algorithm will try to expand
+-- it first when things do not fit onto one line. This allows the last argument to be multi-line without forcing the
+-- preceding arguments to be multiline.
+-- Third, callers may inject `pre` and `post` tokens (mostly newlines) into the inside of the group.
+-- This means that callers can say "try to be compact first, but if more than the last argument does not fit onto the line,
+-- then start on a new line instead".
+-- Out of necessity, callers may also inject `commentPre` and `commentPost`, which will be added before/after the entire
+-- thing if the function has a comment associated with its first token
+prettyApp :: Doc -> Doc -> Doc -> Doc -> Expression -> Expression -> Doc
+prettyApp commentPre pre post commentPost f a
+    = let
+        absorbApp (Application f' a') = (group $ absorbApp f') <> line <> (nest 2 (group a'))
+        absorbApp expr = pretty expr
+
+        absorbLast (Term t) | isAbsorbable t
+            = group' True $ nest 2 $ prettyTerm t
+        absorbLast (Term (Parenthesized (Ann pre' open post') expr close))
+            = group' True $ nest 2 $ base $ pretty (Ann pre' open Nothing)
+                <> (surroundWith line' $ group $ nest 2 $ pretty post' <> pretty expr)
+                <> pretty close
+        absorbLast arg = group' False $ nest 2 $ pretty arg
+
+        -- Extract comment before the first function and move it out, to prevent functions being force-expanded
+        (fWithoutComment, comment') = mapFirstToken' (\(Ann leading token trailing') -> (Ann [] token trailing', leading)) f
+        in
+        (if null comment' then mempty else commentPre)
+        <> pretty comment' <> (group' False $
+            pre <> group (absorbApp fWithoutComment) <> line <> absorbLast a <> post)
+        <> (if null comment' then mempty else commentPost)
+
+isAbstractionWithAbsorbableTerm :: Expression -> Bool
+isAbstractionWithAbsorbableTerm (Abstraction (IDParameter _) _ (Term t)) | isAbsorbable t = True
+isAbstractionWithAbsorbableTerm (Abstraction (IDParameter _) _ body) = isAbstractionWithAbsorbableTerm body
+isAbstractionWithAbsorbableTerm _ = False
+
 isAbsorbable :: Term -> Bool
-isAbsorbable (String (Ann parts@(_:_:_) _ _))
+isAbsorbable (String (Ann _ parts@(_:_:_) _))
     = not $ isSimpleString parts
-isAbsorbable (Set _ _ (_:_) _)                             = True
-isAbsorbable (List (Ann _ Nothing []) [item] _)            = isAbsorbable item
-isAbsorbable (Parenthesized (Ann _ Nothing []) (Term t) _) = isAbsorbable t
-isAbsorbable (List _ (_:_:_) _)                            = True
-isAbsorbable _                                             = False
+isAbsorbable (Set _ _ (Items (_:_)) _)                                   = True
+isAbsorbable (List (Ann [] _ Nothing) (Items [CommentedItem [] _]) _)    = True
+isAbsorbable (Parenthesized (Ann [] _ Nothing) (Term t) _)               = isAbsorbable t
+isAbsorbable (List _ (Items (_:_:_)) _)                                  = True
+isAbsorbable _                                                           = False
 
 absorb :: Doc -> Doc -> Maybe Int -> Expression -> Doc
 absorb left right _ (Term t)
@@ -174,23 +390,16 @@ absorb left right (Just level) x
 absorbSet :: Expression -> Doc
 absorbSet = absorb line mempty Nothing
 
-absorbThen :: Expression -> Doc
-absorbThen (Term t) | isAbsorbable t = hardspace <> prettyTerm t <> hardspace
-absorbThen x                         = line <> nest 2 (group x) <> line
-
+-- Only absorb "else if"
 absorbElse :: Expression -> Doc
 absorbElse (If if_ cond then_ expr0 else_ expr1)
-    = hardspace <> pretty if_ <> hardspace <> group cond <> hardspace
-      <> pretty then_ <> absorbThen expr0
+    -- `if cond then` if it fits on one line, otherwise `if\n  cond\nthen` (with cond indented)
+    -- Using hardline here is okay because it will only apply to nested ifs, which should not be inline anyways.
+    = hardspace <> (group (pretty if_ <> line <> nest 2 (pretty cond) <> line <> pretty then_))
+      <> hardline <> nest 2 (group expr0) <> hardline
       <> pretty else_ <> absorbElse expr1
-
-absorbElse (Term t) | isAbsorbable t = hardspace <> prettyTerm t
-absorbElse x                         = line <> nest 2 (group x)
-
-absorbApp :: Expression -> Doc
-absorbApp (Application f x) = softline <> pretty f <> absorbApp x
-absorbApp (Term t) | isAbsorbable t = hardspace <> group (prettyTerm t)
-absorbApp x = softline <> pretty x
+absorbElse x
+    = line <> nest 2 (group x)
 
 instance Pretty Expression where
     pretty (Term t) = pretty t
@@ -200,16 +409,36 @@ instance Pretty Expression where
           <> nest 2 (group expr0) <> pretty semicolon)
           <> absorbSet expr1
 
-    pretty (Let (Ann let_ letTrailing letLeading) binders
-                (Ann in_ inTrailing inLeading) expr)
-        = base $ group letPart <> line <> group inPart
-        where letPart = pretty let_ <> pretty letTrailing <> line <> letBody
-              inPart = pretty in_ <> hardspace <> pretty expr
-              letBody = nest 2 $
-                  pretty letLeading
-                  <> sepBy hardline binders
-                  <> pretty (toLeading inTrailing)
-                  <> pretty inLeading
+    -- Let bindings are always fully expanded (no single-line form)
+    -- We also take the comments around the `in` (trailing, leading and detached binder comments)
+    -- and move them down to the first token of the body
+    pretty (Let let_ binders (Ann leading in_ trailing') expr)
+        = base $ letPart <> hardline <> inPart
+        where
+          -- Convert the TrailingComment to a Trivium, if present
+          convertTrailing Nothing = []
+          convertTrailing (Just (TrailingComment t)) = [(LineComment (" " <> t))]
+
+          -- Extract detached comments at the bottom.
+          -- This uses a custom variant of span/spanJust/spanMaybe.
+          -- Note that this is a foldr which walks from the bottom, but the lists
+          -- are constructed in a way that they end up correct again.
+          (binderComments, bindersWithoutComments)
+            = foldr
+                (\item -> \(start, rest) ->
+                    case item of
+                        (DetachedComments inner) | null rest -> (inner : start, rest)
+                        _ -> (start, item : rest)
+                )
+                ([], [])
+                (unItems binders)
+
+          letPart = group $ pretty let_ <> hardline <> letBody
+          letBody = nest 2 $ prettyItems hardline (Items bindersWithoutComments)
+          inPart = group $ pretty (Ann [] in_ Nothing) <> hardline
+              -- Take our trailing and inject it between `in` and body
+              <> pretty (concat binderComments ++ leading ++ convertTrailing trailing')
+              <> pretty expr
 
     pretty (Assert assert cond semicolon expr)
         = base (pretty assert <> hardspace
@@ -217,25 +446,59 @@ instance Pretty Expression where
           <> absorbSet expr
 
     pretty (If if_ cond then_ expr0 else_ expr1)
-        = base $ group $
-            pretty if_ <> hardspace <> group cond <> hardspace
-            <> pretty then_ <> absorbThen expr0
+        = base $ group' False $
+            -- `if cond then` if it fits on one line, otherwise `if\n  cond\nthen` (with cond indented)
+            group (pretty if_ <> line <> nest 2 (pretty cond) <> line <> pretty then_)
+            <> (surroundWith line $ nest 2 $ group expr0)
             <> pretty else_ <> absorbElse expr1
 
     pretty (Abstraction (IDParameter param) colon body)
-        = pretty param <> pretty colon <> absorbAbs body
-        where absorbAbs (Abstraction (IDParameter param0) colon0 body0) =
-                  hardspace <> pretty param0 <> pretty colon0 <> absorbAbs body0
-              absorbAbs x = absorbSet x
+        = pretty param <> pretty colon <> absorbAbs 1 body
+        where absorbAbs :: Int -> Expression -> Doc
+              absorbAbs depth (Abstraction (IDParameter param0) colon0 body0) =
+                  hardspace <> pretty param0 <> pretty colon0 <> absorbAbs (depth + 1) body0
+              absorbAbs depth x
+                  | depth <= 2 = absorbSet x
+                  | otherwise = absorb hardline mempty Nothing x
 
     pretty (Abstraction param colon body)
-        = pretty param <> pretty colon <> absorbSet body
+        = pretty param <> pretty colon <> line <> pretty body
 
-    pretty (Application f x) = group $ pretty f <> absorbApp x
+    pretty (Application f a)
+        = prettyApp mempty mempty mempty mempty f a
 
-    pretty (Operation a op b)
-        = pretty a <> softline
-          <> pretty op <> hardspace <> pretty b
+    -- not chainable binary operators: <, >, <=, >=, ==, !=
+    pretty (Operation a op@(Ann _ op' _) b)
+        | op' == TLess || op' == TGreater || op' == TLessEqual || op' == TGreaterEqual || op' == TEqual || op' == TUnequal
+        = pretty a <> softline <> pretty op <> hardspace <> pretty b
+    -- all other operators
+    pretty operation@(Operation _ op _)
+        = let
+            -- Walk the operation tree and put a list of things on the same level.
+            -- We still need to keep the operators around because they might have comments attached to them.
+            -- An operator is put together with its succeeding expression. Only the first operand has none.
+            flatten :: Maybe Leaf -> Expression -> [(Maybe Leaf, Expression)]
+            flatten opL (Operation a opR b) | opR == op = (flatten opL a) ++ (flatten (Just opR) b)
+            flatten opL x = [(opL, x)]
+
+            -- Called on every operand except the first one (a.k.a. RHS)
+            absorbOperation :: Expression -> Doc
+            absorbOperation (Term t) | isAbsorbable t = hardspace <> (base $ pretty t)
+            -- Force nested operations to start on a new line
+            absorbOperation x@(Operation _ _ _) = group' False $ line <> pretty x
+            -- Force applications to start on a new line if more than the last argument is multiline
+            absorbOperation (Application f a) = group $ prettyApp hardline line mempty mempty f a
+            absorbOperation x = hardspace <> pretty x
+
+            prettyOperation :: (Maybe Leaf, Expression) -> Doc
+            -- First element
+            prettyOperation (Nothing, expr) = pretty expr
+            -- The others
+            prettyOperation ((Just op'), expr) =
+                line <> pretty (moveTrailingCommentUp op') <> nest 2 (absorbOperation expr)
+          in
+            group' False $
+                (concat . map prettyOperation . (flatten Nothing)) operation
 
     pretty (MemberCheck expr qmark sel)
         = pretty expr <> softline
@@ -247,19 +510,12 @@ instance Pretty Expression where
     pretty (Inversion bang expr)
         = pretty bang <> pretty expr
 
-instance Pretty File where
-    pretty (File (Ann _ Nothing leading) expr)
-        = group $ hcat leading <> pretty expr <> hardline
-
-    pretty (File (Ann _ (Just (TrailingComment trailing)) leading) expr)
-        = group $ text "# " <> pretty trailing <> hardline
-                  <> hcat leading <> pretty expr <> hardline
+instance Pretty a => Pretty (Whole a) where
+    pretty (Whole x finalTrivia)
+        = group $ pretty x <> pretty finalTrivia
 
 instance Pretty Token where
     pretty = text . tokenText
-
-instance Pretty [Token] where
-    pretty = hcat
 
 -- STRINGS
 
@@ -268,7 +524,7 @@ isSimpleSelector (Selector _ (IDSelector _) Nothing) = True
 isSimpleSelector _                                   = False
 
 isSimple :: Expression -> Bool
-isSimple (Term (Token (Ann (Identifier _) Nothing []))) = True
+isSimple (Term (Token (Ann [] (Identifier _) Nothing))) = True
 isSimple (Term (Selection t selectors))
     = isSimple (Term t) && all isSimpleSelector selectors
 isSimple _ = False
@@ -331,22 +587,26 @@ isSimpleString parts
 
 instance Pretty StringPart where
     pretty (TextPart t) = text t
-    pretty (Interpolation paropen (Term t) parclose)
+    pretty (Interpolation (Whole (Term t) []))
         | isAbsorbable t
-            = group $ pretty paropen <> prettyTerm t <> pretty parclose
+            = group $ text "${" <> prettyTerm t <> text "}"
 
-    pretty (Interpolation paropen expr parclose)
+    pretty (Interpolation (Whole expr []))
         | isSimple expr
-            = pretty paropen <> pretty expr <> pretty parclose
-        | otherwise
-            = group $ pretty paropen <> line'
-                <> nest 2 (pretty expr) <> line'
-                <> pretty parclose
+            = text "${" <> pretty expr <> text "}"
+
+    pretty (Interpolation whole)
+        = group $ text "${" <> line'
+            <> nest 2 (pretty whole) <> line'
+            <> text "}"
 
 instance Pretty [StringPart] where
-    pretty [Interpolation paropen expr parclose]
-        = group $ pretty paropen <> pretty expr <> pretty parclose
+    pretty [Interpolation expr]
+        = group $ text "${" <> pretty expr <> text "}"
 
+    -- If we split a string line over multiple code lines due to large
+    -- interpolations, make sure to indent based on the indentation of the line
+    -- in the string.
     pretty (TextPart t : parts)
         = text t <> nest indentation (hcat parts)
         where indentation = textWidth $ Text.takeWhile isSpace t
@@ -370,7 +630,7 @@ prettyLine escapeText unescapeInterpol
           unescapeInterpols [] = []
           unescapeInterpols (TextPart t : TextPart u : xs)
               = unescapeInterpols (TextPart (t <> u) : xs)
-          unescapeInterpols (TextPart t : xs@(Interpolation _ _ _ : _))
+          unescapeInterpols (TextPart t : xs@(Interpolation{} : _))
               = TextPart (unescapeInterpol t) : unescapeInterpols xs
           unescapeInterpols (x : xs) = x : unescapeInterpols xs
 
